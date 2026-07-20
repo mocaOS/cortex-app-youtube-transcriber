@@ -1,0 +1,50 @@
+{
+  "$schema": "./schema/app.v1.json",
+  "id": "yt-transcriber",
+  "name": "YT Transcriber",
+  "version": "0.1.4",
+  "type": "platform",
+  "description": "Turn YouTube videos and whole channels into clean transcripts inside your knowledge graph",
+  "publisher": {
+    "name": "reneil",
+    "url": "https://github.com/mocaOS"
+  },
+  "icon": "icon.svg",
+  "entry": "index.html",
+  "cortex": {
+    "minVersion": "2.0.0",
+    "keyScope": "read_write",
+    "endpoints": [
+      "upload",
+      "graph/entities",
+      "collections"
+    ],
+    "collections": "all"
+  },
+  "config": [
+    {
+      "name": "VENICE_API_KEY",
+      "type": "secret",
+      "required": true,
+      "auth_header": "Authorization: Bearer VENICE_API_KEY",
+      "auth_host": "api.venice.ai",
+      "description": "Venice AI API key used for video transcription (venice.ai -> Settings -> API keys)"
+    }
+  ],
+  "externalHosts": [],
+  "sharing": {
+    "links": true
+  },
+  "users": false,
+  "capabilities": {
+    "http": {
+      "hosts": [
+        "www.youtube.com",
+        "api.venice.ai"
+      ]
+    },
+    "tasks": {},
+    "storage": {},
+    "llm": {}
+  }
+}
