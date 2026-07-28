@@ -22,6 +22,11 @@ export interface VideoInfo {
   url: string;
 }
 
+const VIDEO_ID_RE = /^[a-zA-Z0-9_-]{11}$/;
+
+/** Safety cap so a malformed/looping continuation chain can't spin forever */
+const MAX_CONTINUATION_PAGES = 100;
+
 const YT_HEADERS = {
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -145,7 +150,14 @@ async function scrapeChannelTab(
   let continuationToken = extractVideosFromData(ytData, channelName, videos, seen);
   onProgress?.(videos.length);
 
-  while (continuationToken) {
+  // Safety cap so a malformed/looping continuation chain can't spin forever
+  const usedTokens = new Set<string>();
+  let pages = 0;
+  while (continuationToken && pages < MAX_CONTINUATION_PAGES) {
+    if (usedTokens.has(continuationToken)) break;
+    usedTokens.add(continuationToken);
+    pages++;
+
     const contRes = await platform("http", {
       method: "POST",
       body: JSON.stringify({
@@ -163,32 +175,70 @@ async function scrapeChannelTab(
     const contData: any = await contRes.json().catch(() => null);
     if (!contData) break;
 
-    continuationToken = null;
-    for (const action of contData?.onResponseReceivedActions || []) {
-      for (const item of action?.appendContinuationItemsAction?.continuationItems || []) {
-        collectItem(item, channelName, videos, seen);
-        const nextToken =
-          item?.continuationItemRenderer?.continuationEndpoint?.continuationCommand?.token;
-        if (nextToken) continuationToken = nextToken;
-      }
-    }
+    // Walk the whole response rather than one known action shape — YouTube
+    // moves items between appendContinuationItemsAction / reloadContinuation…
+    const before = videos.length;
+    collectItems(contData, channelName, videos, seen);
+    const nextToken = findContinuationToken(contData);
+
     onProgress?.(videos.length);
+
+    // Stop when a page adds nothing new and offers no fresh token
+    if (videos.length === before && !nextToken) break;
+    continuationToken = nextToken;
   }
 }
 
-/** One grid item → video, across YouTube's layout generations: the current
- * lockupViewModel, and the legacy videoRenderer/gridVideoRenderer. */
-function collectItem(
-  item: any,
+/** Recursively collects every video in a subtree, across YouTube's layout
+ * generations: the current lockupViewModel, and the legacy
+ * videoRenderer/gridVideoRenderer. */
+function collectItems(
+  node: any,
   channelName: string,
   videos: VideoInfo[],
   seen: Set<string>,
+  depth = 0,
 ): void {
-  const content = item?.richItemRenderer?.content;
-  if (content?.lockupViewModel) addLockup(content.lockupViewModel, channelName, videos, seen);
-  if (content?.videoRenderer) addVideo(content.videoRenderer, channelName, videos, seen);
-  if (item?.lockupViewModel) addLockup(item.lockupViewModel, channelName, videos, seen);
-  if (item?.gridVideoRenderer) addVideo(item.gridVideoRenderer, channelName, videos, seen);
+  if (depth > 30 || !node || typeof node !== "object") return;
+
+  if (Array.isArray(node)) {
+    for (const item of node) collectItems(item, channelName, videos, seen, depth + 1);
+    return;
+  }
+
+  if (node.lockupViewModel) addLockup(node.lockupViewModel, channelName, videos, seen);
+  if (node.videoRenderer) addVideo(node.videoRenderer, channelName, videos, seen);
+  if (node.gridVideoRenderer) addVideo(node.gridVideoRenderer, channelName, videos, seen);
+
+  for (const value of Object.values(node)) {
+    if (value && typeof value === "object") {
+      collectItems(value, channelName, videos, seen, depth + 1);
+    }
+  }
+}
+
+function findContinuationToken(node: any, depth = 0): string | null {
+  if (depth > 30 || !node || typeof node !== "object") return null;
+
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const token = findContinuationToken(item, depth + 1);
+      if (token) return token;
+    }
+    return null;
+  }
+
+  const token =
+    node?.continuationItemRenderer?.continuationEndpoint?.continuationCommand?.token;
+  if (typeof token === "string" && token) return token;
+
+  for (const value of Object.values(node)) {
+    if (value && typeof value === "object") {
+      const found = findContinuationToken(value, depth + 1);
+      if (found) return found;
+    }
+  }
+  return null;
 }
 
 function addLockup(
@@ -197,16 +247,19 @@ function addLockup(
   videos: VideoInfo[],
   seen: Set<string>,
 ): void {
-  if (lockup?.contentType && lockup.contentType !== "LOCKUP_CONTENT_TYPE_VIDEO") return;
+  // Lockups also represent playlists, channels and podcasts — skip those.
+  if (lockup?.contentType && !/VIDEO|SHORT/.test(lockup.contentType)) return;
   const videoId = lockup?.contentId as string;
-  if (!videoId || videoId.length !== 11 || seen.has(videoId)) return;
+  if (!videoId || !VIDEO_ID_RE.test(videoId) || seen.has(videoId)) return;
   seen.add(videoId);
 
   let duration = "";
   for (const overlay of lockup?.contentImage?.thumbnailViewModel?.overlays || []) {
     for (const badge of overlay?.thumbnailBottomOverlayViewModel?.badges || []) {
       const text = badge?.thumbnailBadgeViewModel?.text;
-      if (typeof text === "string" && /^[\d:]+$/.test(text)) duration = text;
+      if (typeof text === "string" && /^\d+(:\d+)+$/.test(text.trim())) {
+        duration = text.trim();
+      }
     }
   }
 
@@ -225,42 +278,29 @@ function extractVideosFromData(
   videos: VideoInfo[],
   seen: Set<string>,
 ): string | null {
-  let continuationToken: string | null = null;
-  const tabs = ytData?.contents?.twoColumnBrowseResultsRenderer?.tabs || [];
+  // Prefer the selected tab's content so unrelated shelves (recommendations,
+  // featured channels) can't leak other channels' videos into the list.
+  const scope = findSelectedTabContent(ytData) ?? ytData;
 
-  for (const tab of tabs) {
-    const tabContent = tab?.tabRenderer?.content || tab?.expandableTabRenderer?.content;
-    if (!tabContent) continue;
-
-    for (const item of tabContent?.richGridRenderer?.contents || []) {
-      collectItem(item, channelName, videos, seen);
-      const token =
-        item?.continuationItemRenderer?.continuationEndpoint?.continuationCommand?.token;
-      if (token) continuationToken = token;
-    }
-
-    for (const section of tabContent?.sectionListRenderer?.contents || []) {
-      const gridItems =
-        section?.itemSectionRenderer?.contents?.[0]?.shelfRenderer?.content?.gridRenderer
-          ?.items ||
-        section?.itemSectionRenderer?.contents?.[0]?.gridRenderer?.items ||
-        [];
-      for (const item of gridItems) {
-        collectItem(item, channelName, videos, seen);
-        const token =
-          item?.continuationItemRenderer?.continuationEndpoint?.continuationCommand?.token;
-        if (token) continuationToken = token;
-      }
-    }
+  collectItems(scope, channelName, videos, seen);
+  if (videos.length === 0 && scope !== ytData) {
+    collectItems(ytData, channelName, videos, seen);
   }
 
-  if (videos.length === 0) sweepForRenderers(ytData, channelName, videos, seen);
-  return continuationToken;
+  return findContinuationToken(scope) ?? findContinuationToken(ytData);
+}
+
+function findSelectedTabContent(ytData: any): any | null {
+  for (const tab of ytData?.contents?.twoColumnBrowseResultsRenderer?.tabs || []) {
+    const renderer = tab?.tabRenderer || tab?.expandableTabRenderer;
+    if (renderer?.selected && renderer?.content) return renderer.content;
+  }
+  return null;
 }
 
 function addVideo(renderer: any, channelName: string, videos: VideoInfo[], seen: Set<string>) {
   const videoId = renderer?.videoId as string;
-  if (!videoId || seen.has(videoId)) return;
+  if (!videoId || !VIDEO_ID_RE.test(videoId) || seen.has(videoId)) return;
   seen.add(videoId);
   videos.push({
     videoId,
@@ -279,22 +319,3 @@ function textFromRuns(obj: any): string {
   return "";
 }
 
-function sweepForRenderers(
-  obj: any,
-  channelName: string,
-  videos: VideoInfo[],
-  seen: Set<string>,
-  depth = 0,
-): void {
-  if (depth > 15 || !obj || typeof obj !== "object") return;
-  if (obj.videoRenderer) addVideo(obj.videoRenderer, channelName, videos, seen);
-  if (obj.gridVideoRenderer) addVideo(obj.gridVideoRenderer, channelName, videos, seen);
-  if (obj.lockupViewModel) addLockup(obj.lockupViewModel, channelName, videos, seen);
-  for (const value of Object.values(obj)) {
-    if (Array.isArray(value)) {
-      for (const item of value) sweepForRenderers(item, channelName, videos, seen, depth + 1);
-    } else if (value && typeof value === "object") {
-      sweepForRenderers(value, channelName, videos, seen, depth + 1);
-    }
-  }
-}
